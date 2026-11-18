@@ -4,6 +4,7 @@ const ffmpegPath = require('ffmpeg-static');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { spawn, execFile } = require('child_process');
 const ytdl = require('@distube/ytdl-core');
 
 ffmpeg.setFfmpegPath(ffmpegPath);
@@ -30,6 +31,126 @@ const folderCounters = {};
 const userNamesCache = new Map();
 const configuredPlayfileDirs = new Set();
 const userSessionState = new Map();
+
+// === מנגנון yt-dlp + PO Token אוטומטי ללא קוקיז ===
+const YTDLP_BIN_PATH = path.join(os.tmpdir(), 'yt-dlp-linux');
+let ytdlpReadyPromise = null;
+let cachedPoTokenData = null;
+let lastPoTokenTime = 0;
+
+async function ensureYtDlpBinary() {
+    if (ytdlpReadyPromise) return ytdlpReadyPromise;
+
+    ytdlpReadyPromise = (async () => {
+        try {
+            if (fs.existsSync(YTDLP_BIN_PATH) && fs.statSync(YTDLP_BIN_PATH).size > 1000000) {
+                await fs.promises.chmod(YTDLP_BIN_PATH, 0o755);
+                return YTDLP_BIN_PATH;
+            }
+            console.log('[yt-dlp] Downloading standalone yt-dlp_linux binary...');
+            const binUrl = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux';
+            const res = await fetchWithTimeout(binUrl, {}, 45000);
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const buf = Buffer.from(await res.arrayBuffer());
+            await fs.promises.writeFile(YTDLP_BIN_PATH, buf);
+            await fs.promises.chmod(YTDLP_BIN_PATH, 0o755);
+            console.log(`[yt-dlp] Binary ready at ${YTDLP_BIN_PATH} (${buf.length} bytes)`);
+            return YTDLP_BIN_PATH;
+        } catch (err) {
+            console.warn('[yt-dlp] Binary setup error:', err.message);
+            ytdlpReadyPromise = null;
+            throw err;
+        }
+    })();
+
+    return ytdlpReadyPromise;
+}
+
+// הפקת PO Token ו-Visitor Data ללא קוקיז (באמצעות youtube-po-token-generator)
+async function getFreshPoToken() {
+    if (cachedPoTokenData && (Date.now() - lastPoTokenTime < 3600000)) {
+        return cachedPoTokenData;
+    }
+    try {
+        const { generate } = require('youtube-po-token-generator');
+        const tokenData = await generate();
+        if (tokenData && tokenData.poToken && tokenData.visitorData) {
+            cachedPoTokenData = tokenData;
+            lastPoTokenTime = Date.now();
+            console.log('[PO Token] Generated fresh PO Token & VisitorData successfully');
+            return tokenData;
+        }
+    } catch (err) {
+        console.warn('[PO Token] Generator warning:', err.message);
+    }
+    return null;
+}
+
+// הורדת שמע באמצעות yt-dlp + PO Token (עוקף חסימת בוט ב-Render ללא קוקיז)
+async function downloadWithYtDlpNoCookies(videoId, targetFilePath, maxDurationSec = 900, timeoutMs = 25000) {
+    const binPath = await ensureYtDlpBinary();
+    const poData = await getFreshPoToken();
+
+    const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
+    const client Strategies = [];
+
+    if (poData && poData.poToken && poData.visitorData) {
+        clientStrategies.push(
+            `youtube:player_client=mweb,web;po_token=mweb+${poData.poToken},web+${poData.poToken};visitor_data=${poData.visitorData}`
+        );
+    }
+    clientStrategies.push(
+        'youtube:player_client=ios,android_vr,tv_embedded,mweb',
+        'youtube:player_client=android_vr,tv'
+    );
+
+    let lastErr = '';
+    for (const extractorArg of clientStrategies) {
+        try {
+            if (fs.existsSync(targetFilePath)) {
+                await fs.promises.unlink(targetFilePath).catch(() => null);
+            }
+
+            const args = [
+                '--no-playlist',
+                '--no-check-certificates',
+                '--no-cache-dir',
+                '--force-ipv4',
+                '--extractor-args', extractorArg,
+                '-f', 'bestaudio[abr<=96]/bestaudio/worst',
+                '--ffmpeg-location', ffmpegPath
+            ];
+
+            if (maxDurationSec > 0 && maxDurationSec <= 950) {
+                args.push('--download-sections', `*0-${maxDurationSec}`);
+            }
+
+            args.push('-o', targetFilePath, videoUrl);
+
+            await new Promise((resolve, reject) => {
+                const proc = execFile(binPath, args, { timeout: timeoutMs, maxBuffer: 8 * 1024 * 1024 }, (error, stdout, stderr) => {
+                    if (fs.existsSync(targetFilePath) && fs.statSync(targetFilePath).size > 25000) {
+                        return resolve();
+                    }
+                    reject(new Error((stderr || (error && error.message) || 'yt-dlp failed').slice(-300)));
+                });
+            });
+
+            if (fs.existsSync(targetFilePath)) {
+                const sz = fs.statSync(targetFilePath).size;
+                if (sz > 25000) {
+                    console.log(`[yt-dlp Success] Downloaded ${sz} bytes using ${extractorArg.slice(0, 45)}`);
+                    return sz;
+                }
+            }
+        } catch (err) {
+            lastErr = err.message;
+            console.warn(`[yt-dlp Attempt Failed] (${extractorArg.slice(0, 35)}):`, lastErr.slice(0, 160));
+        }
+    }
+
+    throw new Error('YTDLP_ALL_STRATEGIES_FAILED: ' + lastErr);
+}
 
 function lastVal(param) {
     if (Array.isArray(param)) {
@@ -470,199 +591,33 @@ async function convertSegmentToWavFast(inputPath, outputWavPath, startSec = 0, d
     });
 }
 
-// === גרסה 34.0: שליפת קישורי שמע מ-Piped API + Invidious מעודכנים במקביל כדי לעקוף חסימת IP של יוטיוב ===
-async function getFastStreamUrls(videoId) {
-    const pipedApis = [
-        'https://pipedapi.kavin.rocks',
-        'https://pipedapi.tokhmi.xyz',
-        'https://pipedapi.syncpundit.io',
-        'https://pipedapi.adminforge.de',
-        'https://api.piped.private.coffee',
-        'https://pipedapi.drgns.space'
-    ];
-
-    const invidiousHosts = [
-        'https://inv.nadeko.net',
-        'https://invidious.nerdvpn.de',
-        'https://invidious.jing.rocks',
-        'https://invidious.privacyredirect.com',
-        'https://yewtu.be',
-        'https://inv.tux.pizza'
-    ];
-
-    const urls = [];
-
-    // 1. בדיקה מהירה מול שרתי Piped API במקביל
-    const pipedTask = Promise.any(pipedApis.map(async (apiHost) => {
-        const res = await fetchWithTimeout(`${apiHost}/streams/${videoId}`, {
-            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
-        }, 3500);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = await res.json();
-        const audioStreams = (data.audioStreams || []).filter(s => s && s.url);
-        if (audioStreams.length === 0) throw new Error('No Piped audio');
-        audioStreams.sort((a, b) => (parseInt(a.bitrate) || 999999) - (parseInt(b.bitrate) || 999999));
-        return audioStreams.slice(0, 3).map(s => s.url);
-    })).catch(() => []);
-
-    // 2. בדיקה מהירה מול שרתי Invidious API במקביל
-    const invidiousTask = Promise.any(invidiousHosts.map(async (host) => {
-        const apiRes = await fetchWithTimeout(`${host}/api/v1/videos/${videoId}`, {
-            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
-        }, 3500);
-        if (!apiRes.ok) throw new Error(`HTTP ${apiRes.status}`);
-        const data = await apiRes.json();
-        const formats = (data.adaptiveFormats || []).filter(f => (f.type || '').startsWith('audio/'));
-        if (formats.length === 0) throw new Error('No Invidious audio');
-        formats.sort((a, b) => (parseInt(a.bitrate) || 999999) - (parseInt(b.bitrate) || 999999));
-        const extracted = [];
-        for (const fmt of formats.slice(0, 2)) {
-            if (fmt.url) extracted.push(fmt.url);
-            extracted.push(`${host}/latest_version?id=${videoId}&itag=${fmt.itag || 140}&local=true`);
-        }
-        return extracted;
-    })).catch(() => []);
-
-    const [pipedUrls, invUrls] = await Promise.all([pipedTask, invidiousTask]);
-    urls.push(...pipedUrls, ...invUrls);
-
-    // 3. קישורי פרוקסי ישירים לגיבוי
-    for (const host of invidiousHosts.slice(0, 4)) {
-        urls.push(`${host}/latest_version?id=${videoId}&itag=140&local=true`);
-        urls.push(`${host}/latest_version?id=${videoId}&itag=139&local=true`);
-        urls.push(`${host}/latest_version?id=${videoId}&itag=249&local=true`);
-    }
-
-    return [...new Set(urls)];
-}
-
-// הורדה באמצעות ytdl עם לקוחות מובייל (IOS/ANDROID) שעוקפים חסימת בוט בשרתי ענן
-async function downloadWithYtdlMobileClient(videoId, targetFilePath, maxBytes, timeoutMs = 15000) {
-    return new Promise((resolve, reject) => {
-        let dl = 0;
-        const ws = fs.createWriteStream(targetFilePath);
-        const ytdlOpts = {
-            filter: 'audioonly',
-            quality: 'lowestaudio',
-            playerClients: ['IOS', 'ANDROID', 'WEB_EMBEDDED', 'TV']
-        };
-        const st = ytdl(`https://www.youtube.com/watch?v=${videoId}`, ytdlOpts);
-        const tm = setTimeout(() => {
-            try { st.destroy(); } catch (e) {}
-            ws.end(() => dl >= 30000 ? resolve(dl) : reject(new Error('ytdl timeout')));
-        }, timeoutMs);
-
-        st.on('data', c => {
-            dl += c.length;
-            ws.write(c);
-            if (dl >= maxBytes) {
-                clearTimeout(tm);
-                try { st.destroy(); } catch (e) {}
-                ws.end(() => resolve(dl));
-            }
-        });
-        st.on('end', () => {
-            clearTimeout(tm);
-            ws.end(() => dl >= 30000 ? resolve(dl) : reject(new Error('ytdl empty stream')));
-        });
-        st.on('error', e => {
-            clearTimeout(tm);
-            ws.end(() => dl >= 250000 ? resolve(dl) : reject(e));
-        });
-    });
-}
-
-async function downloadStreamFastToLocalFile(streamUrl, targetFilePath, maxBytes, timeoutMs = 15000) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    let downloaded = 0;
-
-    try {
-        const res = await fetch(streamUrl, {
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                'Range': `bytes=0-${maxBytes}`
-            },
-            signal: controller.signal
-        });
-
-        if (!res.ok && res.status !== 206) {
-            throw new Error(`HTTP ${res.status}`);
-        }
-
-        const cType = (res.headers.get('content-type') || '').toLowerCase();
-        if (cType.includes('text/html') || cType.includes('application/json')) {
-            throw new Error(`Invalid content-type: ${cType}`);
-        }
-
-        const fileStream = fs.createWriteStream(targetFilePath);
-        for await (const chunk of res.body) {
-            downloaded += chunk.length;
-            fileStream.write(chunk);
-            if (downloaded >= maxBytes) {
-                try { controller.abort(); } catch (e) {}
-                break;
-            }
-        }
-
-        await new Promise(r => fileStream.end(r));
-        clearTimeout(timer);
-
-        if (downloaded < 30000) {
-            throw new Error(`Downloaded too small (${downloaded} bytes)`);
-        }
-        return downloaded;
-    } catch (e) {
-        clearTimeout(timer);
-        if (downloaded >= 250000 && fs.existsSync(targetFilePath)) {
-            return downloaded;
-        }
-        throw e;
-    }
-}
-
+// הורדה חכמה בגרסה 35.0: yt-dlp + PO Token ללא קוקיז!
 async function downloadAndPreparePlayback(videoId, livePlayFolder, archiveUserFolder, durationSeconds = 0) {
     const cleanLive = String(livePlayFolder).replace(/^ivr2:\/*/, '').replace(/^\/*/, '').replace(/\/*$/, '');
     const cleanArchive = String(archiveUserFolder).replace(/^ivr2:\/*/, '').replace(/^\/*/, '').replace(/\/*$/, '');
-
-    const streamUrls = await getFastStreamUrls(videoId);
-    let workingUrl = null;
-    let initialDownloadedBytes = 0;
-    const QUICK_LIMIT_BYTES = 5.5 * 1024 * 1024;
 
     const tmpQuickInput = path.join(os.tmpdir(), `quick_in_${videoId}_${Date.now()}.audio`);
     const tmpQuickWav = path.join(os.tmpdir(), `quick_out_${videoId}_${Date.now()}.wav`);
 
     try {
-        for (const sUrl of streamUrls.slice(0, 8)) {
-            try {
-                initialDownloadedBytes = await downloadStreamFastToLocalFile(sUrl, tmpQuickInput, QUICK_LIMIT_BYTES, 9000);
-                await convertSegmentToWavFast(tmpQuickInput, tmpQuickWav, 0, 900);
-                if (fs.existsSync(tmpQuickWav) && fs.statSync(tmpQuickWav).size > 20000) {
-                    workingUrl = sUrl;
-                    console.log(`[Part 1 Fast Start] Success from proxy stream`);
-                    break;
-                }
-            } catch (err) {
-                console.warn(`[Part 1 Fast Start] URL attempt failed: ${err.message}`);
-            }
-        }
+        // שלב 1: הורדת 15 הדקות הראשונות באמצעות yt-dlp + PO Token (ללא קוקיז)
+        let initialDownloadedBytes = 0;
+        const isLongVideo = durationSeconds > 900;
+        const firstChunkDuration = isLongVideo ? 905 : 0;
 
-        if (!workingUrl) {
-            initialDownloadedBytes = await downloadWithYtdlMobileClient(videoId, tmpQuickInput, QUICK_LIMIT_BYTES, 12000);
-            await convertSegmentToWavFast(tmpQuickInput, tmpQuickWav, 0, 900);
-        }
+        initialDownloadedBytes = await downloadWithYtDlpNoCookies(videoId, tmpQuickInput, firstChunkDuration, 24000);
+        await convertSegmentToWavFast(tmpQuickInput, tmpQuickWav, 0, 900);
 
         let quickWavBuf = await fs.promises.readFile(tmpQuickWav);
         fs.promises.unlink(tmpQuickInput).catch(() => null);
         fs.promises.unlink(tmpQuickWav).catch(() => null);
 
-        const hitDownloadCeiling = initialDownloadedBytes >= (QUICK_LIMIT_BYTES - 350000);
         const isFullFifteenMin = quickWavBuf.length >= 13800000;
         const isLongStream = (durationSeconds > 900)
             ? true
-            : (durationSeconds > 0 ? false : (hitDownloadCeiling || isFullFifteenMin));
+            : (durationSeconds > 0 ? false : isFullFifteenMin);
 
+        // אם הסרטון עד 15 דקות -> מעלים קובץ אחד בלבד
         if (!isLongStream) {
             const singleNum = await getNextFileNumberStr(cleanLive, 1);
             const singlePath = `ivr2:/${cleanLive}/${singleNum}.wav`;
@@ -683,6 +638,7 @@ async function downloadAndPreparePlayback(videoId, livePlayFolder, archiveUserFo
             return `f-/${cleanLive}/${singleNum}`;
         }
 
+        // אם הסרטון ארוך מ-15 דקות -> מחשבים את מספר החלקים המדויק ומורידים את ההמשך ברקע
         const TOTAL_PARTS = durationSeconds > 900
             ? Math.min(6, Math.max(2, Math.ceil((durationSeconds - 10) / 900)))
             : 6;
@@ -700,22 +656,7 @@ async function downloadAndPreparePlayback(videoId, livePlayFolder, archiveUserFo
             const validSegments = [];
 
             try {
-                const MAX_FULL_BYTES = 48 * 1024 * 1024;
-                let fullBytes = 0;
-                let downloadedFullOk = false;
-
-                if (workingUrl) {
-                    try {
-                        fullBytes = await downloadStreamFastToLocalFile(workingUrl, tmpFullIn, MAX_FULL_BYTES, 90000);
-                        downloadedFullOk = true;
-                    } catch (e) {
-                        downloadedFullOk = false;
-                    }
-                }
-
-                if (!downloadedFullOk) {
-                    fullBytes = await downloadWithYtdlMobileClient(videoId, tmpFullIn, MAX_FULL_BYTES, 90000);
-                }
+                await downloadWithYtDlpNoCookies(videoId, tmpFullIn, 0, 95000);
 
                 const segments = [];
                 for (let idx = 0; idx < TOTAL_PARTS; idx++) {
@@ -802,7 +743,7 @@ async function downloadAndPreparePlayback(videoId, livePlayFolder, archiveUserFo
 
 const MAIN_MENU_TEXT = 'ברוכים הבאים לחיפוש ביוטיוב! לשמיעת הפלייליסט שלכם הקישו 1 לשמיעת שיעורי התורה שלכם הקישו 2 לחיפוש מוזיקה חדש הקישו 3 לחיפוש שיעור חדש הקישו 4! שימו לב אם הסרטון ארוך מ 15 דקות הוא עולה בחלקים לשלוחת הפלייליסט או לשלוחת השיעורי תורה ! לחזרה לשלוחה הקודמת הקישו כוכבית! הקו מנוטר משתמש שיחפש תוכן לא ראוי יחסם ';
 
-app.get('/', (req, res) => { res.send('YouTube Personal Line Server v34.0 (Piped + Invidious + Mobile Client Fix) OK'); });
+app.get('/', (req, res) => { res.send('YouTube Personal Line Server v35.0 (yt-dlp + PO Token No Cookies) OK'); });
 
 app.all(['/yemot', '/yemot/:e'], async (req, res) => {
     const q = { ...req.query, ...req.body };
@@ -1073,7 +1014,7 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
         return res.send(`read=t-${MAIN_MENU_TEXT}=MenuChoice,no,1,0,7,Digits,no`);
 
     } catch (e) {
-        console.error('[General Error v34.0]', e.message);
+        console.error('[General Error v35.0]', e.message);
         if (!res.headersSent) {
             return res.send(`read=t-${MAIN_MENU_TEXT}=MenuChoice,no,1,0,7,Digits,no`);
         }
@@ -1081,4 +1022,10 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
 });
 
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`=== Server v34.0 Ready on port ${port} ===`));
+app.listen(port, async () => {
+    console.log(`=== Server v35.0 Ready on port ${port} ===`);
+    try {
+        await ensureYtDlpBinary();
+        await getFreshPoToken();
+    } catch (e) {}
+});
